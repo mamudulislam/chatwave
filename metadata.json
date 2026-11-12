@@ -1,0 +1,6 @@
+{
+  "name": "ChatWave",
+  "description": "Modern real-time messaging, voice & video calling, encrypted chats, and disappearing stories inspired by WhatsApp",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
