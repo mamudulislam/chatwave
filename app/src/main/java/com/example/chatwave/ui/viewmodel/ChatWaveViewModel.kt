@@ -1,306 +1,325 @@
-package com.example.chatwave.ui.viewmodel
+﻿package com.example.chatwave.ui.viewmodel
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.chatwave.data.model.*
-import com.example.chatwave.data.security.ActiveCallState
-import com.example.chatwave.data.security.EncryptedDataRepository
-import com.example.chatwave.data.security.IncomingCallState
-import kotlinx.coroutines.flow.*
+import com.example.chatwave.calling.CallCommand
+import com.example.chatwave.calling.CallCommandBus
+import com.example.chatwave.calling.CallForegroundService
+import com.example.chatwave.crypto.ChatWaveIdGenerator
+import com.example.chatwave.crypto.InvitationCodeGenerator
+import com.example.chatwave.data.local.CallRecordEntity
+import com.example.chatwave.data.local.DeviceEntity
+import com.example.chatwave.data.local.InvitationEntity
+import com.example.chatwave.data.local.SecuritySettingsEntity
+import com.example.chatwave.data.local.TrustedContactEntity
+import com.example.chatwave.data.local.UserProfileEntity
+import com.example.chatwave.data.model.CallHistoryUi
+import com.example.chatwave.data.model.CallUiStateModel
+import com.example.chatwave.data.model.ContactUi
+import com.example.chatwave.data.model.DiagnosticsUi
+import com.example.chatwave.data.model.InviteUi
+import com.example.chatwave.data.model.ScreenDestination
+import com.example.chatwave.data.model.UserProfileUi
+import com.example.chatwave.di.AppGraph
+import com.example.chatwave.webrtc.CallDirection
+import com.example.chatwave.webrtc.CallUiState
+import com.example.chatwave.webrtc.RealtimeEvent
+import com.example.chatwave.webrtc.RemoteCallSession
+import com.example.chatwave.webrtc.RemotePublicIdentity
+import com.example.chatwave.webrtc.WebRtcCallManager
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-
-enum class ScreenDestination {
-  SPLASH,
-  AUTH_LOGIN,
-  AUTH_REGISTER,
-  AUTH_OTP,
-  AUTH_FORGOT_PASSWORD,
-  HOME,
-  CHAT_DETAIL,
-  GROUP_INFO,
-  CREATE_GROUP,
-  CREATE_STATUS,
-  STATUS_VIEWER,
-  PROFILE,
-  SETTINGS,
-  SETTINGS_PRIVACY,
-  SETTINGS_WALLPAPER,
-  ADD_CONTACT
-}
-
-enum class HomeTab {
-  CHATS,
-  STATUS,
-  CALLS,
-  CONTACTS
-}
+import java.util.UUID
 
 class ChatWaveViewModel(application: Application) : AndroidViewModel(application) {
+  private val local = AppGraph.localRepository
+  private val backend = AppGraph.backendRepository
+  private val identity = AppGraph.identityKeyManager
+  private val pinManager = AppGraph.pinManager
+  private val sessionManager = AppGraph.sessionManager
+  private val recoveryManager = AppGraph.recoveryManager
+  private val callManager: WebRtcCallManager = AppGraph.webRtcCallManager
+  private val signaling = AppGraph.signalingClient
 
-  val repository = EncryptedDataRepository(application.applicationContext)
+  private val _screen = MutableStateFlow(ScreenDestination.SPLASH)
+  val screen: StateFlow<ScreenDestination> = _screen.asStateFlow()
+  private val _loading = MutableStateFlow(false)
+  val loading: StateFlow<Boolean> = _loading.asStateFlow()
+  private val _error = MutableStateFlow<String?>(null)
+  val error: StateFlow<String?> = _error.asStateFlow()
+  private val _notice = MutableStateFlow<String?>(null)
+  val notice: StateFlow<String?> = _notice.asStateFlow()
+  private val _incomingCall = MutableStateFlow<RealtimeEvent.IncomingCall?>(null)
+  val incomingCall: StateFlow<RealtimeEvent.IncomingCall?> = _incomingCall.asStateFlow()
 
-  // Navigation State
-  private val _currentScreen = MutableStateFlow(ScreenDestination.SPLASH)
-  val currentScreen: StateFlow<ScreenDestination> = _currentScreen.asStateFlow()
-
-  private val _homeTab = MutableStateFlow(HomeTab.CHATS)
-  val homeTab: StateFlow<HomeTab> = _homeTab.asStateFlow()
-
-  private val _selectedChat = MutableStateFlow<Chat?>(null)
-  val selectedChat: StateFlow<Chat?> = _selectedChat.asStateFlow()
-
-  private val _selectedStory = MutableStateFlow<UserStatusStory?>(null)
-  val selectedStory: StateFlow<UserStatusStory?> = _selectedStory.asStateFlow()
-
-  // Search & Filter
-  private val _searchQuery = MutableStateFlow("")
-  val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
-
-  private val _isSearching = MutableStateFlow(false)
-  val isSearching: StateFlow<Boolean> = _isSearching.asStateFlow()
-
-  // Selected Message for contextual action bar (reply, react, edit, delete)
-  private val _selectedMessage = MutableStateFlow<Message?>(null)
-  val selectedMessage: StateFlow<Message?> = _selectedMessage.asStateFlow()
-
-  // Pending reply message
-  private val _replyingToMessage = MutableStateFlow<Message?>(null)
-  val replyingToMessage: StateFlow<Message?> = _replyingToMessage.asStateFlow()
-
-  // Editing message text
-  private val _editingMessage = MutableStateFlow<Message?>(null)
-  val editingMessage: StateFlow<Message?> = _editingMessage.asStateFlow()
-
-  // Auth Inputs
-  var pendingAuthPhone = "+1 555 019 2834"
-
-  // Repositories StateFlows
-  val currentUser = repository.currentUser
-  val isAuthenticated = repository.isAuthenticated
-  val contacts = repository.contacts
-  val chats = repository.chats
-  val messagesMap = repository.messagesMap
-  val typingStatus = repository.typingStatus
-  val callHistory = repository.callHistory
-  val activeCall = repository.activeCall
-  val incomingCall = repository.incomingCall
-  val userStories = repository.userStories
-  val settings = repository.settings
-  val persistenceError = repository.persistenceError
+  val profile = local.profile.map { it?.toUi() ?: UserProfileUi(backendUrl = AppGraph.backendApi.baseUrl) }
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserProfileUi(backendUrl = AppGraph.backendApi.baseUrl))
+  val contacts = local.contacts.map { list -> list.map { it.toUi() } }
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList<ContactUi>())
+  val invites = local.invitations.map { list -> list.sortedByDescending { it.createdAt }.map { it.toUi() } }
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList<InviteUi>())
+  val history = local.callHistory.map { list -> list.sortedByDescending { it.startedAt }.map { it.toUi() } }
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList<CallHistoryUi>())
+  val settings = local.settings.map { it ?: SecuritySettingsEntity() }
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SecuritySettingsEntity())
+  val callState = callManager.state.map { it?.toUi() ?: CallUiStateModel() }
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), CallUiStateModel())
+  val diagnostics = combine(settings, signaling.connected, profile, error) { s, connected, p, err ->
+    DiagnosticsUi(AppGraph.backendApi.baseUrl, connected, AppGraph.backendApi.baseUrl.isNotBlank(), s.relayOnly, err, p.fingerprint, p.publicKeyVersion)
+  }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DiagnosticsUi())
 
   init {
     viewModelScope.launch {
-      // Show splash for 1.2s then route to HOME or AUTH
-      kotlinx.coroutines.delay(1200)
-      if (repository.isAuthenticated.value) {
-        _currentScreen.value = ScreenDestination.HOME
-      } else {
-        _currentScreen.value = ScreenDestination.AUTH_LOGIN
+      val p = local.getProfile()
+      _screen.value = when {
+        p == null -> ScreenDestination.FIRST_LAUNCH
+        pinManager.isLocked() || sessionManager.isExpired() -> ScreenDestination.UNLOCK
+        else -> ScreenDestination.HOME
+      }
+      if (p != null && !sessionManager.isExpired()) signaling.connect()
+    }
+    viewModelScope.launch {
+      signaling.events.collect { event ->
+        when (event) {
+          is RealtimeEvent.IncomingCall -> handleIncomingCall(event)
+          is RealtimeEvent.Signal -> handleSignal(event)
+          is RealtimeEvent.Error -> _error.value = event.message
+          else -> {}
+        }
+      }
+    }
+    viewModelScope.launch {
+      CallCommandBus.commands.collect { cmd ->
+        when (cmd) {
+          is CallCommand.Accept -> acceptIncomingCall(cmd.sessionId)
+          is CallCommand.Decline -> declineIncomingCall(cmd.sessionId)
+          is CallCommand.End -> endCall(cmd.sessionId)
+        }
+      }
+    }
+    viewModelScope.launch {
+      callManager.state.collect { s ->
+        if (s == null) return@collect
+        when (s.state) {
+          CallUiState.CONNECTED -> CallForegroundService.ongoing(getApplication(), s.sessionId, s.peerName, s.isVideo)
+          CallUiState.ENDED, CallUiState.FAILED, CallUiState.IDLE -> CallForegroundService.stop(getApplication())
+          else -> {}
+        }
+        if (s.state == CallUiState.ENDED || s.state == CallUiState.FAILED) {
+          val existing = local.callHistory.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList()).value.find { it.id == s.sessionId }
+          if (existing != null && existing.endedAt == 0L) local.finishCallRecord(s.sessionId, s.state.name.lowercase(), s.durationSeconds)
+        }
       }
     }
   }
 
-  // --- Navigation Controls ---
-  fun navigateTo(screen: ScreenDestination) {
-    _currentScreen.value = screen
-    if (screen == ScreenDestination.HOME) {
-      _selectedChat.value = null
-      _selectedStory.value = null
-      _selectedMessage.value = null
-      _replyingToMessage.value = null
-      _editingMessage.value = null
+  fun clearError() { _error.value = null }
+  fun clearNotice() { _notice.value = null }
+  fun navigate(screen: ScreenDestination) { _screen.value = screen }
+
+  fun createAccount(displayName: String, pin: String, backendUrl: String) = viewModelScope.launch {
+    _loading.value = true; _error.value = null
+    runCatching {
+      val trimmed = displayName.trim()
+      require(trimmed.length in 2..40) { "Display name must be 2-40 characters" }
+      AppGraph.backendApi.updateBaseUrl(backendUrl)
+      val id = ChatWaveIdGenerator.generate()
+      val recovery = recoveryManager.createBackup()
+      val profile = UserProfileEntity(
+        chatwaveId = id,
+        displayName = trimmed,
+        publicKey = "",
+        publicKeyVersion = 1,
+        deviceId = UUID.randomUUID().toString(),
+        recoveryHash = recovery.recoveryHash,
+        isRegistered = false
+      )
+      val pk = identity.initialize(1, false)
+      val full = profile.copy(publicKey = android.util.Base64.encodeToString(pk.der, android.util.Base64.NO_WRAP), fingerprint = pk.fingerprint)
+      pinManager.createPin(pin)
+      local.saveProfile(full)
+      local.saveSettings(SecuritySettingsEntity(backendBaseUrl = AppGraph.backendApi.baseUrl))
+      val remote = backend.register(full)
+      local.saveProfile(full.copy(isRegistered = true, fingerprint = remote.fingerprint))
+      sessionManager.unlock()
+      signaling.connect()
+      _notice.value = "Recovery token (save offline): ${recovery.recoveryToken}"
+      _screen.value = ScreenDestination.HOME
+    }.onFailure { _error.value = it.message ?: "create_account_failed" }
+    _loading.value = false
+  }
+
+  fun unlock(pin: String) = viewModelScope.launch {
+    _loading.value = true; _error.value = null
+    val result = pinManager.verifyPin(pin)
+    if (result.isSuccess) {
+      sessionManager.unlock(); signaling.connect(); _screen.value = ScreenDestination.HOME
+    } else _error.value = result.exceptionOrNull()?.message ?: "unlock_failed"
+    _loading.value = false
+  }
+
+  fun lock() { sessionManager.lock(); signaling.disconnect(); _screen.value = ScreenDestination.UNLOCK }
+
+  fun addContact(chatwaveId: String) = viewModelScope.launch {
+    _loading.value = true; _error.value = null
+    runCatching {
+      val remote = backend.lookup(chatwaveId.trim().uppercase())
+      local.saveContact(TrustedContactEntity(remote.chatwaveId, remote.displayName, remote.publicKey, remote.publicKeyVersion, remote.fingerprint, System.currentTimeMillis(), false))
+      _notice.value = "Contact added. Verify safety code before first call."
+    }.onFailure { _error.value = it.message ?: "lookup_failed" }
+    _loading.value = false
+  }
+
+  fun createInvitation() = viewModelScope.launch {
+    val p = local.getProfile() ?: return@launch
+    _loading.value = true; _error.value = null
+    runCatching {
+      val created = backend.createInvitation(p)
+      local.saveInvitation(com.example.chatwave.data.remote.BackendRepository.toInvitationEntity(p, created))
+      _notice.value = "Invite code: ${created.formattedCode}"
+    }.onFailure { _error.value = it.message ?: "invite_create_failed" }
+    _loading.value = false
+  }
+
+  fun redeemInvitation(code: String) = viewModelScope.launch {
+    val p = local.getProfile() ?: return@launch
+    _loading.value = true; _error.value = null
+    runCatching {
+      val res = backend.redeemInvitation(code, p)
+      local.saveContact(TrustedContactEntity(res.inviter.chatwaveId, res.inviter.displayName, res.inviter.publicKey, res.inviter.publicKeyVersion, res.inviter.fingerprint, System.currentTimeMillis(), false))
+      _notice.value = "Contact added. Safety code: ${res.safetyCode}"
+    }.onFailure { _error.value = it.message ?: "invite_redeem_failed" }
+    _loading.value = false
+  }
+
+  fun verifyContact(contactId: String) = viewModelScope.launch { local.verifyContact(contactId); _notice.value = "Contact verified" }
+
+  fun startCall(contact: ContactUi, video: Boolean) = viewModelScope.launch {
+    val p = local.getProfile() ?: return@launch
+    val s = settings.value
+    _loading.value = true; _error.value = null
+    runCatching {
+      val remoteIdentity = backend.lookup(contact.chatwaveId)
+      val existing = local.getContact(contact.chatwaveId)
+      val fingerprint = remoteIdentity.fingerprint
+      if (existing != null && existing.publicKey.isNotBlank() && existing.fingerprint != fingerprint) {
+        local.markKeyChange(contact.chatwaveId)
+        throw IllegalStateException("identity_key_changed")
+      }
+      local.saveContact(TrustedContactEntity(remoteIdentity.chatwaveId, remoteIdentity.displayName, remoteIdentity.publicKey, remoteIdentity.publicKeyVersion, remoteIdentity.fingerprint, System.currentTimeMillis(), existing?.isVerified == true))
+      val localEphemeral = AppGraph.sessionKeyManager.generateEphemeralKeyPair()
+      val safetyCode = com.example.chatwave.crypto.SafetyCode.derive(remoteIdentity.chatwaveId, p.chatwaveId, android.util.Base64.decode(remoteIdentity.publicKey, android.util.Base64.NO_WRAP), android.util.Base64.decode(p.publicKey, android.util.Base64.NO_WRAP))
+      val created = backend.createCall(contact.chatwaveId, p, s.relayOnly, android.util.Base64.encodeToString(localEphemeral.public.encoded, android.util.Base64.NO_WRAP), p.fingerprint, safetyCode)
+      val session = created
+      local.addCallRecord(CallRecordEntity(session.id, contact.chatwaveId, contact.displayName, "outgoing", if (video) "video" else "audio", "ringing", System.currentTimeMillis(), 0, 0))
+      callManager.startOutgoing(session, remoteIdentity, p, video, s.relayOnly, safetyCode)
+      _screen.value = if (video) ScreenDestination.ACTIVE_VIDEO_CALL else ScreenDestination.ACTIVE_AUDIO_CALL
+    }.onFailure { _error.value = it.message ?: "call_failed" }
+    _loading.value = false
+  }
+
+  private fun handleIncomingCall(event: RealtimeEvent.IncomingCall) {
+    viewModelScope.launch {
+      val p = local.getProfile() ?: return@launch
+      val contact = local.getContact(event.caller.chatwaveId)
+      if (contact != null && contact.fingerprint.isNotBlank() && contact.fingerprint != event.caller.fingerprint) {
+        local.markKeyChange(event.caller.chatwaveId)
+        _error.value = "Caller identity key changed. Verify before accepting."
+      }
+      local.saveContact(TrustedContactEntity(event.caller.chatwaveId, event.caller.displayName, event.caller.publicKey, event.caller.publicKeyVersion, event.caller.fingerprint, System.currentTimeMillis(), contact?.isVerified == true && contact.fingerprint == event.caller.fingerprint))
+      _incomingCall.value = event
+      val isVideo = false // caller type not in payload; default audio, updated by offer
+      CallForegroundService.incoming(getApplication(), event.sessionId, event.caller.chatwaveId, event.caller.displayName, isVideo)
+      local.addCallRecord(CallRecordEntity(event.sessionId, event.caller.chatwaveId, event.caller.displayName, "incoming", "audio", "ringing", System.currentTimeMillis(), 0, 0))
+      _screen.value = ScreenDestination.INCOMING_CALL
     }
   }
 
-  fun setHomeTab(tab: HomeTab) {
-    _homeTab.value = tab
-    _isSearching.value = false
-    _searchQuery.value = ""
+  fun acceptIncomingCall(sessionId: String? = null) = viewModelScope.launch {
+    val event = _incomingCall.value ?: return@launch
+    if (sessionId != null && event.sessionId != sessionId) return@launch
+    val p = local.getProfile() ?: return@launch
+    val s = settings.value
+    _loading.value = true; _error.value = null
+    runCatching {
+      val localEphemeral = AppGraph.sessionKeyManager.generateEphemeralKeyPair()
+      val safetyCode = com.example.chatwave.crypto.SafetyCode.derive(p.chatwaveId, event.caller.chatwaveId, android.util.Base64.decode(p.publicKey, android.util.Base64.NO_WRAP), android.util.Base64.decode(event.caller.publicKey, android.util.Base64.NO_WRAP))
+      val session = backend.acceptCall(event.sessionId, event.caller.chatwaveId, p, android.util.Base64.encodeToString(localEphemeral.public.encoded, android.util.Base64.NO_WRAP), p.fingerprint, safetyCode)
+      callManager.prepareIncoming(session, event.caller, p, false, s.relayOnly || event.relayOnly, event.safetyCode.ifBlank { safetyCode })
+      callManager.acceptIncoming()
+      _incomingCall.value = null
+      CallForegroundService.ongoing(getApplication(), event.sessionId, event.caller.displayName, false)
+      _screen.value = ScreenDestination.ACTIVE_AUDIO_CALL
+    }.onFailure { _error.value = it.message ?: "accept_failed" }
+    _loading.value = false
   }
 
-  fun toggleSearch() {
-    _isSearching.value = !_isSearching.value
-    if (!_isSearching.value) _searchQuery.value = ""
+  fun declineIncomingCall(sessionId: String? = null) = viewModelScope.launch {
+    val event = _incomingCall.value ?: return@launch
+    if (sessionId != null && event.sessionId != sessionId) return@launch
+    runCatching { callManager.declineCall() }
+    _incomingCall.value = null
+    CallForegroundService.stop(getApplication())
+    _screen.value = ScreenDestination.HOME
   }
 
-  fun setSearchQuery(query: String) {
-    _searchQuery.value = query
+  fun endCall(sessionId: String? = null) = viewModelScope.launch {
+    val s = callManager.state.value ?: return@launch
+    if (sessionId != null && s.sessionId != sessionId) return@launch
+    runCatching { callManager.endCall() }
+    CallForegroundService.stop(getApplication())
+    _screen.value = ScreenDestination.CALL_SUMMARY
   }
 
-  fun openChat(chat: Chat) {
-    _selectedChat.value = chat
-    _currentScreen.value = ScreenDestination.CHAT_DETAIL
-  }
-
-  fun openStory(story: UserStatusStory) {
-    _selectedStory.value = story
-    _currentScreen.value = ScreenDestination.STATUS_VIEWER
-  }
-
-  // --- Auth Actions ---
-  fun login(emailOrPhone: String, pass: String): Boolean {
-    val success = repository.login(emailOrPhone, pass)
-    if (success) {
-      _currentScreen.value = ScreenDestination.HOME
+  private fun handleSignal(event: RealtimeEvent.Signal) {
+    viewModelScope.launch {
+      val payload = event.data.toSignalPayload()
+      when (event.kind) {
+        "offer" -> {
+          val isVideo = payload.sdp?.contains("m=video") == true
+          callManager.state.value?.let { st -> if (st.isVideo != isVideo) {} }
+          runCatching { callManager.onRemoteOffer(event.sessionId, payload) }
+          val st = callManager.state.value
+          if (st != null) _screen.value = if (st.isVideo) ScreenDestination.ACTIVE_VIDEO_CALL else ScreenDestination.ACTIVE_AUDIO_CALL
+        }
+        "answer" -> runCatching { callManager.onRemoteAnswer(event.sessionId, payload) }
+        "ice" -> callManager.onRemoteIce(event.sessionId, payload)
+        "end" -> { callManager.markEnded(); CallForegroundService.stop(getApplication()); _screen.value = ScreenDestination.CALL_SUMMARY }
+        "decline" -> { callManager.markEnded(); _incomingCall.value = null; CallForegroundService.stop(getApplication()); _screen.value = ScreenDestination.HOME }
+        "busy" -> { callManager.fail("Peer busy"); CallForegroundService.stop(getApplication()) }
+        "restart" -> if (payload.type == "offer") runCatching { callManager.onRemoteOffer(event.sessionId, payload) }
+      }
     }
-    return success
   }
 
-  fun register(name: String, email: String, phone: String, pass: String): Boolean {
-    pendingAuthPhone = phone
-    val success = repository.register(name, email, phone, pass)
-    if (success) {
-      _currentScreen.value = ScreenDestination.AUTH_OTP
-    }
-    return success
+  fun toggleMute() = callManager.toggleMute()
+  fun toggleSpeaker() = callManager.toggleSpeaker()
+  fun toggleCamera() = callManager.toggleCamera()
+  fun switchCamera() = callManager.switchCamera()
+
+  fun updateSettings(mutator: (SecuritySettingsEntity) -> SecuritySettingsEntity) = viewModelScope.launch {
+    val next = mutator(local.getSettings())
+    local.saveSettings(next)
+    AppGraph.backendApi.updateBaseUrl(next.backendBaseUrl)
   }
 
-  fun verifyOtp(otp: String): Boolean {
-    if (otp.length == 4 || otp.length == 6) {
-      _currentScreen.value = ScreenDestination.HOME
-      return true
-    }
-    return false
+  fun saveBackendUrl(url: String) = updateSettings { it.copy(backendBaseUrl = url.trim()) }
+  fun setRelayOnly(enabled: Boolean) = updateSettings { it.copy(relayOnly = enabled) }
+  fun wipeLocalData() = viewModelScope.launch {
+    runCatching { signaling.disconnect(); callManager.clear(); AppGraph.database.clearAllTables(); pinManager.clear(); sessionManager.lock(); _screen.value = ScreenDestination.FIRST_LAUNCH }
+      .onFailure { _error.value = it.message ?: "wipe_failed" }
   }
 
-  fun logout() {
-    repository.logout()
-    _currentScreen.value = ScreenDestination.AUTH_LOGIN
-  }
-
-  // --- Messaging Actions ---
-  fun sendMessage(text: String, type: MessageType = MessageType.TEXT, mediaCaption: String = "", audioDurationSec: Int = 0) {
-    val chat = _selectedChat.value ?: return
-
-    val editing = _editingMessage.value
-    if (editing != null) {
-      repository.editMessage(chat.id, editing.id, text)
-      _editingMessage.value = null
-      return
-    }
-
-    repository.sendMessage(
-      chatId = chat.id,
-      text = text,
-      type = type,
-      mediaCaption = mediaCaption,
-      audioDurationSec = audioDurationSec,
-      replyTo = _replyingToMessage.value
-    )
-    _replyingToMessage.value = null
-  }
-
-  fun setSelectedMessage(message: Message?) {
-    _selectedMessage.value = message
-  }
-
-  fun setReplyingTo(message: Message?) {
-    _replyingToMessage.value = message
-    _selectedMessage.value = null
-  }
-
-  fun setEditingMessage(message: Message?) {
-    _editingMessage.value = message
-    _selectedMessage.value = null
-  }
-
-  fun cancelEditing() {
-    _editingMessage.value = null
-  }
-
-  fun cancelReply() {
-    _replyingToMessage.value = null
-  }
-
-  fun deleteSelectedMessage(forEveryone: Boolean) {
-    val chat = _selectedChat.value ?: return
-    val msg = _selectedMessage.value ?: return
-    if (forEveryone) {
-      repository.deleteMessageForEveryone(chat.id, msg.id)
-    } else {
-      repository.deleteMessageForMe(chat.id, msg.id)
-    }
-    _selectedMessage.value = null
-  }
-
-  fun reactToSelectedMessage(emoji: String) {
-    val chat = _selectedChat.value ?: return
-    val msg = _selectedMessage.value ?: return
-    repository.addReaction(chat.id, msg.id, emoji)
-    _selectedMessage.value = null
-  }
-
-  // --- Calls ---
-  fun startCallWithUser(user: User, isVideo: Boolean) {
-    repository.startCall(
-      peerId = user.id,
-      peerName = user.name,
-      peerAvatarColor = user.avatarColorHex,
-      isVideo = isVideo
-    )
-  }
-
-  fun startCallFromCurrentChat(isVideo: Boolean) {
-    val chat = _selectedChat.value ?: return
-    repository.startCall(
-      peerId = chat.id,
-      peerName = chat.name,
-      peerAvatarColor = chat.avatarColorHex,
-      isVideo = isVideo
-    )
-  }
-
-  fun toggleMute() = repository.toggleMute()
-  fun toggleCamera() = repository.toggleCamera()
-  fun toggleSpeaker() = repository.toggleSpeaker()
-  fun endCall() = repository.endCall()
-  fun acceptIncomingCall() = repository.acceptIncomingCall()
-  fun rejectIncomingCall() = repository.rejectIncomingCall()
-
-  fun triggerIncomingCallSimulation() {
-    val randomContact = repository.contacts.value.firstOrNull() ?: return
-    repository.simulateIncomingCall(randomContact, isVideo = true)
-  }
-
-  // --- Status Stories ---
-  fun postStatus(textContent: String, colorHex: String, caption: String = "") {
-    repository.postStatus(textContent, colorHex, caption)
-    _currentScreen.value = ScreenDestination.HOME
-    _homeTab.value = HomeTab.STATUS
-  }
-
-  fun markStatusViewed(statusId: String) {
-    repository.markStatusViewed(statusId)
-  }
-
-  // --- Contacts & Groups ---
-  fun addContact(name: String, phone: String, about: String) {
-    val newContact = repository.addContact(name, phone, about)
-    val chat = repository.startOrGetChatWithContact(newContact)
-    openChat(chat)
-  }
-
-  fun createGroup(name: String, selectedContactIds: List<String>, description: String) {
-    val newGroupChat = repository.createGroup(name, selectedContactIds, description)
-    openChat(newGroupChat)
-  }
-
-  fun startChatWithContact(contact: User) {
-    val chat = repository.startOrGetChatWithContact(contact)
-    openChat(chat)
-  }
-
-  // --- Settings ---
-  fun updateSettings(newSettings: SettingsState) {
-    repository.updateSettings(newSettings)
-  }
-
-  fun updateProfile(name: String, about: String, phone: String) {
-    repository.updateCurrentUserProfile(name, about, phone)
-  }
-
-  fun toggleBlockUser(userId: String) {
-    repository.toggleBlockUser(userId)
-  }
+  private fun UserProfileEntity.toUi() = UserProfileUi(chatwaveId, displayName, fingerprint, publicKeyVersion, deviceId, AppGraph.backendApi.baseUrl)
+  private fun TrustedContactEntity.toUi() = ContactUi(chatwaveId, displayName, fingerprint, isVerified, lastSeenAt)
+  private fun InvitationEntity.toUi() = InviteUi(codeHash, inviterId, inviterId, code, createdAt, status)
+  private fun CallRecordEntity.toUi() = CallHistoryUi(id, peerId, peerDisplayName, direction, callType, state, startedAt, durationSeconds)
+  private fun com.example.chatwave.webrtc.CallSessionState.toUi() = CallUiStateModel(sessionId, peerId, peerName, if (isVideo) "video" else "audio", direction.name.lowercase(), state.name.lowercase(), durationSeconds, isMuted, isSpeakerEnabled, isCameraEnabled, relayOnly, safetyCode, peerFingerprint, error)
 }
