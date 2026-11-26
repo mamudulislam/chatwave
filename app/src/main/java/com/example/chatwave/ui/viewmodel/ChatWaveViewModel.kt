@@ -8,6 +8,7 @@ import com.example.chatwave.calling.CallCommandBus
 import com.example.chatwave.calling.CallForegroundService
 import com.example.chatwave.crypto.ChatWaveIdGenerator
 import com.example.chatwave.crypto.InvitationCodeGenerator
+import com.example.chatwave.crypto.SafetyCode
 import com.example.chatwave.data.local.CallRecordEntity
 import com.example.chatwave.data.local.DeviceEntity
 import com.example.chatwave.data.local.InvitationEntity
@@ -28,6 +29,7 @@ import com.example.chatwave.webrtc.RealtimeEvent
 import com.example.chatwave.webrtc.RemoteCallSession
 import com.example.chatwave.webrtc.RemotePublicIdentity
 import com.example.chatwave.webrtc.WebRtcCallManager
+import com.example.chatwave.webrtc.toSignalPayload
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -47,6 +49,8 @@ class ChatWaveViewModel(application: Application) : AndroidViewModel(application
   private val recoveryManager = AppGraph.recoveryManager
   private val callManager: WebRtcCallManager = AppGraph.webRtcCallManager
   private val signaling = AppGraph.signalingClient
+  private val idGenerator = ChatWaveIdGenerator()
+
 
   private val _screen = MutableStateFlow(ScreenDestination.SPLASH)
   val screen: StateFlow<ScreenDestination> = _screen.asStateFlow()
@@ -114,7 +118,7 @@ class ChatWaveViewModel(application: Application) : AndroidViewModel(application
         }
         if (s.state == CallUiState.ENDED || s.state == CallUiState.FAILED) {
           val existing = local.callHistory.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList()).value.find { it.id == s.sessionId }
-          if (existing != null && existing.endedAt == 0L) local.finishCallRecord(s.sessionId, s.state.name.lowercase(), s.durationSeconds)
+          if (existing != null && existing.endedAt == null) local.finishCallRecord(s.sessionId, s.state.name.lowercase(), s.durationSeconds)
         }
       }
     }
@@ -129,28 +133,35 @@ class ChatWaveViewModel(application: Application) : AndroidViewModel(application
     runCatching {
       val trimmed = displayName.trim()
       require(trimmed.length in 2..40) { "Display name must be 2-40 characters" }
-      AppGraph.backendApi.updateBaseUrl(backendUrl)
-      val id = ChatWaveIdGenerator.generate()
-      val recovery = recoveryManager.createBackup()
-      val profile = UserProfileEntity(
-        chatwaveId = id,
-        displayName = trimmed,
-        publicKey = "",
-        publicKeyVersion = 1,
-        deviceId = UUID.randomUUID().toString(),
-        recoveryHash = recovery.recoveryHash,
-        isRegistered = false
-      )
+      val baseUrl = backendUrl.trim()
+      require(baseUrl.isNotBlank()) { "Backend URL is required" }
+      AppGraph.backendApi.updateBaseUrl(baseUrl)
+      val recoveryToken = recoveryManager.generateToken()
       val pk = identity.initialize(1, false)
-      val full = profile.copy(publicKey = android.util.Base64.encodeToString(pk.der, android.util.Base64.NO_WRAP), fingerprint = pk.fingerprint)
+      val now = System.currentTimeMillis()
+      val profile = UserProfileEntity(
+        chatwaveId = idGenerator.generate(),
+        displayName = trimmed,
+        publicKey = android.util.Base64.encodeToString(pk.der, android.util.Base64.NO_WRAP),
+        publicKeyVersion = pk.version,
+        fingerprint = pk.fingerprint,
+        recoveryHash = recoveryManager.hash(recoveryToken),
+        deviceId = UUID.randomUUID().toString(),
+        createdAt = now,
+        updatedAt = now
+      )
       pinManager.createPin(pin)
-      local.saveProfile(full)
-      local.saveSettings(SecuritySettingsEntity(backendBaseUrl = AppGraph.backendApi.baseUrl))
-      val remote = backend.register(full)
-      local.saveProfile(full.copy(isRegistered = true, fingerprint = remote.fingerprint))
+      local.saveProfile(profile)
+      local.getSettings()
+      val remote = backend.register(profile)
+      local.saveProfile(profile.copy(
+        fingerprint = remote.fingerprint.ifBlank { pk.fingerprint },
+        registeredRemotely = true,
+        updatedAt = System.currentTimeMillis()
+      ))
       sessionManager.unlock()
       signaling.connect()
-      _notice.value = "Recovery token (save offline): ${recovery.recoveryToken}"
+      _notice.value = "Recovery token (save offline): ${recoveryManager.formatForDisplay(recoveryToken)}"
       _screen.value = ScreenDestination.HOME
     }.onFailure { _error.value = it.message ?: "create_account_failed" }
     _loading.value = false
@@ -168,10 +179,24 @@ class ChatWaveViewModel(application: Application) : AndroidViewModel(application
   fun lock() { sessionManager.lock(); signaling.disconnect(); _screen.value = ScreenDestination.UNLOCK }
 
   fun addContact(chatwaveId: String) = viewModelScope.launch {
+    val p = local.getProfile() ?: return@launch
     _loading.value = true; _error.value = null
     runCatching {
       val remote = backend.lookup(chatwaveId.trim().uppercase())
-      local.saveContact(TrustedContactEntity(remote.chatwaveId, remote.displayName, remote.publicKey, remote.publicKeyVersion, remote.fingerprint, System.currentTimeMillis(), false))
+      val now = System.currentTimeMillis()
+      val safetyCode = SafetyCode.compute(p.chatwaveId, p.fingerprint, remote.chatwaveId, remote.fingerprint)
+      local.saveContact(TrustedContactEntity(
+        chatwaveId = remote.chatwaveId,
+        displayName = remote.displayName,
+        publicKey = remote.publicKey,
+        publicKeyVersion = remote.publicKeyVersion,
+        fingerprint = remote.fingerprint,
+        safetyCode = safetyCode,
+        verified = false,
+        keyChangeDetected = false,
+        createdAt = now,
+        updatedAt = now
+      ))
       _notice.value = "Contact added. Verify safety code before first call."
     }.onFailure { _error.value = it.message ?: "lookup_failed" }
     _loading.value = false
@@ -193,7 +218,19 @@ class ChatWaveViewModel(application: Application) : AndroidViewModel(application
     _loading.value = true; _error.value = null
     runCatching {
       val res = backend.redeemInvitation(code, p)
-      local.saveContact(TrustedContactEntity(res.inviter.chatwaveId, res.inviter.displayName, res.inviter.publicKey, res.inviter.publicKeyVersion, res.inviter.fingerprint, System.currentTimeMillis(), false))
+      val now = System.currentTimeMillis()
+      local.saveContact(TrustedContactEntity(
+        chatwaveId = res.inviter.chatwaveId,
+        displayName = res.inviter.displayName,
+        publicKey = res.inviter.publicKey,
+        publicKeyVersion = res.inviter.publicKeyVersion,
+        fingerprint = res.inviter.fingerprint,
+        safetyCode = res.safetyCode,
+        verified = false,
+        keyChangeDetected = false,
+        createdAt = now,
+        updatedAt = now
+      ))
       _notice.value = "Contact added. Safety code: ${res.safetyCode}"
     }.onFailure { _error.value = it.message ?: "invite_redeem_failed" }
     _loading.value = false
@@ -213,12 +250,35 @@ class ChatWaveViewModel(application: Application) : AndroidViewModel(application
         local.markKeyChange(contact.chatwaveId)
         throw IllegalStateException("identity_key_changed")
       }
-      local.saveContact(TrustedContactEntity(remoteIdentity.chatwaveId, remoteIdentity.displayName, remoteIdentity.publicKey, remoteIdentity.publicKeyVersion, remoteIdentity.fingerprint, System.currentTimeMillis(), existing?.isVerified == true))
+      val safetyCode = SafetyCode.compute(p.chatwaveId, p.fingerprint, remoteIdentity.chatwaveId, remoteIdentity.fingerprint)
+      val now = System.currentTimeMillis()
+      local.saveContact(TrustedContactEntity(
+        chatwaveId = remoteIdentity.chatwaveId,
+        displayName = remoteIdentity.displayName,
+        publicKey = remoteIdentity.publicKey,
+        publicKeyVersion = remoteIdentity.publicKeyVersion,
+        fingerprint = remoteIdentity.fingerprint,
+        safetyCode = safetyCode,
+        verified = existing?.verified == true,
+        keyChangeDetected = false,
+        createdAt = now,
+        updatedAt = now
+      ))
       val localEphemeral = AppGraph.sessionKeyManager.generateEphemeralKeyPair()
-      val safetyCode = com.example.chatwave.crypto.SafetyCode.derive(remoteIdentity.chatwaveId, p.chatwaveId, android.util.Base64.decode(remoteIdentity.publicKey, android.util.Base64.NO_WRAP), android.util.Base64.decode(p.publicKey, android.util.Base64.NO_WRAP))
-      val created = backend.createCall(contact.chatwaveId, p, s.relayOnly, android.util.Base64.encodeToString(localEphemeral.public.encoded, android.util.Base64.NO_WRAP), p.fingerprint, safetyCode)
-      val session = created
-      local.addCallRecord(CallRecordEntity(session.id, contact.chatwaveId, contact.displayName, "outgoing", if (video) "video" else "audio", "ringing", System.currentTimeMillis(), 0, 0))
+      val session = backend.createCall(contact.chatwaveId, p, s.relayOnly, android.util.Base64.encodeToString(localEphemeral.public.encoded, android.util.Base64.NO_WRAP), p.fingerprint, safetyCode)
+      local.addCallRecord(CallRecordEntity(
+        id = session.id,
+        peerId = contact.chatwaveId,
+        peerName = contact.displayName,
+        direction = "outgoing",
+        state = "ringing",
+        startedAt = now,
+        endedAt = null,
+        durationSeconds = 0,
+        video = video,
+        safetyCode = safetyCode,
+        relayOnly = s.relayOnly
+      ))
       callManager.startOutgoing(session, remoteIdentity, p, video, s.relayOnly, safetyCode)
       _screen.value = if (video) ScreenDestination.ACTIVE_VIDEO_CALL else ScreenDestination.ACTIVE_AUDIO_CALL
     }.onFailure { _error.value = it.message ?: "call_failed" }
@@ -227,17 +287,40 @@ class ChatWaveViewModel(application: Application) : AndroidViewModel(application
 
   private fun handleIncomingCall(event: RealtimeEvent.IncomingCall) {
     viewModelScope.launch {
-      val p = local.getProfile() ?: return@launch
       val contact = local.getContact(event.caller.chatwaveId)
       if (contact != null && contact.fingerprint.isNotBlank() && contact.fingerprint != event.caller.fingerprint) {
         local.markKeyChange(event.caller.chatwaveId)
         _error.value = "Caller identity key changed. Verify before accepting."
       }
-      local.saveContact(TrustedContactEntity(event.caller.chatwaveId, event.caller.displayName, event.caller.publicKey, event.caller.publicKeyVersion, event.caller.fingerprint, System.currentTimeMillis(), contact?.isVerified == true && contact.fingerprint == event.caller.fingerprint))
+      val now = System.currentTimeMillis()
+      val verified = contact?.verified == true && contact.fingerprint == event.caller.fingerprint
+      local.saveContact(TrustedContactEntity(
+        chatwaveId = event.caller.chatwaveId,
+        displayName = event.caller.displayName,
+        publicKey = event.caller.publicKey,
+        publicKeyVersion = event.caller.publicKeyVersion,
+        fingerprint = event.caller.fingerprint,
+        safetyCode = event.safetyCode,
+        verified = verified,
+        keyChangeDetected = false,
+        createdAt = now,
+        updatedAt = now
+      ))
       _incomingCall.value = event
-      val isVideo = false // caller type not in payload; default audio, updated by offer
-      CallForegroundService.incoming(getApplication(), event.sessionId, event.caller.chatwaveId, event.caller.displayName, isVideo)
-      local.addCallRecord(CallRecordEntity(event.sessionId, event.caller.chatwaveId, event.caller.displayName, "incoming", "audio", "ringing", System.currentTimeMillis(), 0, 0))
+      CallForegroundService.incoming(getApplication(), event.sessionId, event.caller.chatwaveId, event.caller.displayName, false)
+      local.addCallRecord(CallRecordEntity(
+        id = event.sessionId,
+        peerId = event.caller.chatwaveId,
+        peerName = event.caller.displayName,
+        direction = "incoming",
+        state = "ringing",
+        startedAt = now,
+        endedAt = null,
+        durationSeconds = 0,
+        video = false,
+        safetyCode = event.safetyCode,
+        relayOnly = event.relayOnly
+      ))
       _screen.value = ScreenDestination.INCOMING_CALL
     }
   }
@@ -250,7 +333,7 @@ class ChatWaveViewModel(application: Application) : AndroidViewModel(application
     _loading.value = true; _error.value = null
     runCatching {
       val localEphemeral = AppGraph.sessionKeyManager.generateEphemeralKeyPair()
-      val safetyCode = com.example.chatwave.crypto.SafetyCode.derive(p.chatwaveId, event.caller.chatwaveId, android.util.Base64.decode(p.publicKey, android.util.Base64.NO_WRAP), android.util.Base64.decode(event.caller.publicKey, android.util.Base64.NO_WRAP))
+      val safetyCode = SafetyCode.compute(p.chatwaveId, p.fingerprint, event.caller.chatwaveId, event.caller.fingerprint)
       val session = backend.acceptCall(event.sessionId, event.caller.chatwaveId, p, android.util.Base64.encodeToString(localEphemeral.public.encoded, android.util.Base64.NO_WRAP), p.fingerprint, safetyCode)
       callManager.prepareIncoming(session, event.caller, p, false, s.relayOnly || event.relayOnly, event.safetyCode.ifBlank { safetyCode })
       callManager.acceptIncoming()
@@ -305,21 +388,28 @@ class ChatWaveViewModel(application: Application) : AndroidViewModel(application
   fun switchCamera() = callManager.switchCamera()
 
   fun updateSettings(mutator: (SecuritySettingsEntity) -> SecuritySettingsEntity) = viewModelScope.launch {
-    val next = mutator(local.getSettings())
-    local.saveSettings(next)
-    AppGraph.backendApi.updateBaseUrl(next.backendBaseUrl)
+    local.saveSettings(mutator(local.getSettings()))
   }
 
-  fun saveBackendUrl(url: String) = updateSettings { it.copy(backendBaseUrl = url.trim()) }
+  fun saveBackendUrl(url: String) {
+    val trimmed = url.trim()
+    if (trimmed.isBlank()) {
+      _error.value = "Backend URL is required"
+      return
+    }
+    AppGraph.backendApi.updateBaseUrl(trimmed)
+    _notice.value = "Backend URL updated"
+  }
+
   fun setRelayOnly(enabled: Boolean) = updateSettings { it.copy(relayOnly = enabled) }
   fun wipeLocalData() = viewModelScope.launch {
     runCatching { signaling.disconnect(); callManager.clear(); AppGraph.database.clearAllTables(); pinManager.clear(); sessionManager.lock(); _screen.value = ScreenDestination.FIRST_LAUNCH }
       .onFailure { _error.value = it.message ?: "wipe_failed" }
   }
 
-  private fun UserProfileEntity.toUi() = UserProfileUi(chatwaveId, displayName, fingerprint, publicKeyVersion, deviceId, AppGraph.backendApi.baseUrl)
-  private fun TrustedContactEntity.toUi() = ContactUi(chatwaveId, displayName, fingerprint, isVerified, lastSeenAt)
-  private fun InvitationEntity.toUi() = InviteUi(codeHash, inviterId, inviterId, code, createdAt, status)
-  private fun CallRecordEntity.toUi() = CallHistoryUi(id, peerId, peerDisplayName, direction, callType, state, startedAt, durationSeconds)
+  private fun UserProfileEntity.toUi() = UserProfileUi(chatwaveId, displayName, fingerprint, publicKeyVersion, deviceId, AppGraph.backendApi.baseUrl, biometricEnabled)
+  private fun TrustedContactEntity.toUi() = ContactUi(chatwaveId, displayName, fingerprint, verified, updatedAt)
+  private fun InvitationEntity.toUi() = InviteUi(codeHash, inviterId, inviterId, maskedCode, createdAt, status)
+  private fun CallRecordEntity.toUi() = CallHistoryUi(id, peerId, peerName, direction, if (video) "video" else "audio", state, startedAt, durationSeconds)
   private fun com.example.chatwave.webrtc.CallSessionState.toUi() = CallUiStateModel(sessionId, peerId, peerName, if (isVideo) "video" else "audio", direction.name.lowercase(), state.name.lowercase(), durationSeconds, isMuted, isSpeakerEnabled, isCameraEnabled, relayOnly, safetyCode, peerFingerprint, error)
 }

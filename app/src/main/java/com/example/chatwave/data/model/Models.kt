@@ -6,13 +6,22 @@ enum class ScreenDestination {
   SETTINGS, DEVICE_SECURITY, DIAGNOSTICS
 }
 
+enum class MessageStatus { SENDING, SENT, DELIVERED, READ }
+
+data class MessageReaction(
+  val emoji: String,
+  val senderId: String = "",
+  val createdAt: Long = 0L
+)
+
 data class UserProfileUi(
   val chatwaveId: String = "",
   val displayName: String = "",
   val fingerprint: String = "",
   val publicKeyVersion: Int = 1,
   val deviceId: String = "",
-  val backendUrl: String = ""
+  val backendUrl: String = "",
+  val biometricEnabled: Boolean = false
 )
 
 data class ContactUi(

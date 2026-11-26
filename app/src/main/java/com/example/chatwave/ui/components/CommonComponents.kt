@@ -182,7 +182,7 @@ fun ReactionsRow(
   if (reactions.isEmpty()) return
 
   val grouped = remember(reactions) {
-    reactions.groupBy { it.emoji }.mapValues { it.value.size }
+    reactions.groupBy { it.emoji }.mapValues { (_, list) -> list.size }
   }
 
   Surface(
@@ -197,7 +197,7 @@ fun ReactionsRow(
       verticalAlignment = Alignment.CenterVertically,
       horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
-      grouped.forEach { (emoji, count) ->
+      for ((emoji, count) in grouped) {
         Text(text = emoji, fontSize = 13.sp)
         if (count > 1) {
           Text(

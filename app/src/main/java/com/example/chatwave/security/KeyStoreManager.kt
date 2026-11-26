@@ -5,13 +5,11 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import androidx.biometric.BiometricManager.Authenticators
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.PublicKey
-import java.security.spec.ECGenParameterSpec
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -47,9 +45,11 @@ class KeyStoreManager(context: Context) {
 
   fun getOrCreateIdentityKeyPair(alias: String, requireAuthentication: Boolean): KeyPair {
     if (hasKey(alias)) {
-      val key = keyStore.getKey(alias, null) as? PrivateKey
+      val privateKey = keyStore.getKey(alias, null) as? PrivateKey
         ?: throw IllegalStateException("Identity key alias does not contain a private key")
-      return KeyPair(key.publicKey, key)
+      val publicKey = keyStore.getCertificate(alias)?.publicKey
+        ?: throw IllegalStateException("Identity key alias does not contain a certificate")
+      return KeyPair(publicKey, privateKey)
     }
     val builder = KeyGenParameterSpec.Builder(
       alias,
@@ -59,11 +59,10 @@ class KeyStoreManager(context: Context) {
       .setUserAuthenticationRequired(requireAuthentication)
       .setUserAuthenticationValidityDurationSeconds(if (requireAuthentication) 300 else -1)
     if (requireAuthentication && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-      builder.setAllowedAuthenticators(Authenticators.BIOMETRIC_STRONG or Authenticators.DEVICE_CREDENTIAL)
       builder.setInvalidatedByBiometricEnrollment(true)
     }
     val generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, ANDROID_KEYSTORE)
-    generator.initialize(builder.build(), ECGenParameterSpec("secp256r1"))
+    generator.initialize(builder.build())
     return generator.generateKeyPair()
   }
 
@@ -71,7 +70,9 @@ class KeyStoreManager(context: Context) {
     keyStore.getKey(alias, null) as? PrivateKey
       ?: throw IllegalStateException("Identity key is not available")
 
-  fun getPublicKey(alias: String): PublicKey = getIdentityPrivateKey(alias).publicKey
+  fun getPublicKey(alias: String): PublicKey =
+    keyStore.getCertificate(alias)?.publicKey
+      ?: throw IllegalStateException("Identity key is not available")
 
   fun encrypt(alias: String, plaintext: ByteArray, associatedData: ByteArray? = null): String {
     val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_AES}/${KeyProperties.BLOCK_MODE_GCM}/${KeyProperties.ENCRYPTION_PADDING_NONE}")

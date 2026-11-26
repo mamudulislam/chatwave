@@ -23,12 +23,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.example.chatwave.data.model.ScreenDestination
+import com.example.chatwave.di.AppGraph
 import com.example.chatwave.ui.viewmodel.ChatWaveViewModel
 
 @Composable
 fun SettingsScreen(vm: ChatWaveViewModel) {
   val settings by vm.settings.collectAsState()
-  var backendUrl by remember(settings.backendBaseUrl) { mutableStateOf(settings.backendBaseUrl) }
+  var backendUrl by remember(AppGraph.backendApi.baseUrl) { mutableStateOf(AppGraph.backendApi.baseUrl) }
   Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
     Text("Settings", style = MaterialTheme.typography.headlineSmall)
     OutlinedTextField(backendUrl, { backendUrl = it }, label = { Text("Backend URL") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
@@ -45,14 +46,13 @@ fun SettingsScreen(vm: ChatWaveViewModel) {
 @Composable
 fun DeviceSecurityScreen(vm: ChatWaveViewModel) {
   val profile by vm.profile.collectAsState()
-  val settings by vm.settings.collectAsState()
-  Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-    Text("Device & Security", style = MaterialTheme.typography.headlineSmall)
+    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+      Text("Device & Security", style = MaterialTheme.typography.headlineSmall)
     Text("ChatWave ID: ${profile.chatwaveId}")
     Text("Device ID: ${profile.deviceId}")
     Text("Fingerprint: ${profile.fingerprint}")
     Text("Key version: ${profile.publicKeyVersion}")
-    Text("Biometric: ${if (settings.biometricEnabled) "enabled" else "not enabled"}")
+    Text("Biometric: ${if (profile.biometricEnabled) "enabled" else "not enabled"}")
     Button(onClick = { vm.lock() }, modifier = Modifier.fillMaxWidth()) { Text("Lock now") }
     OutlinedButton(onClick = { vm.wipeLocalData() }, modifier = Modifier.fillMaxWidth()) { Text("Wipe local data") }
     OutlinedButton(onClick = { vm.navigate(ScreenDestination.SETTINGS) }, modifier = Modifier.fillMaxWidth()) { Text("Back") }
